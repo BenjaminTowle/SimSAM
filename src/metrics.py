@@ -26,9 +26,12 @@ def compute_metrics(eval_pred, write_path: str = "data/results.json"):
         with open(write_path, "w") as f:
             json.dump(results, f)
 
-    results = {name: np.mean(result) for name, result in results.items()}
-    
-    return results
+    agg_results = {}
+    for name, result in results.items():
+        agg_results[name] = np.mean(result)
+        agg_results[name + "_std"] = np.std(result)
+
+    return agg_results
 
 
 class Metric(ABC):
@@ -96,7 +99,6 @@ def iou(A: np.array, B: np.array) -> float:
         #print("Warning: union is empty.")
         return 0.0
     return np.sum(intersection) / np.sum(union)
-
 
 
 @Metric.register_subclass("nsd")

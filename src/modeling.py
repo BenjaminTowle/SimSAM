@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from transformers.models.sam.modeling_sam import (
     SamModel, 
@@ -11,36 +11,17 @@ from transformers.models.sam.modeling_sam import (
     SamImageSegmentationOutput,
 )
 from typing import Optional, Callable
+from time import perf_counter
 
 from src.click import ClickStrategy
 from src.metrics import iou
-from src.utils import RegistryMixin
 
 
 @dataclass
 class SamMultimaskOutput(SamImageSegmentationOutput):
     loss: torch.FloatTensor = None
-    input_points: torch.Tensor = None
-    iou_targets: torch.Tensor = None
-    iou_pred: torch.Tensor = None
-    input_labels: torch.Tensor = None
-    initial_pred_masks: torch.Tensor = None
     union: torch.Tensor = None
     intersection: torch.Tensor = None
-
-
-class SimilarityScorer(ABC, RegistryMixin):
-
-    @abstractmethod
-    def score(self, A: np.array, B: np.array) -> float:
-        pass
-
-
-@SimilarityScorer.register_subclass("iou")
-class IOUScorer(SimilarityScorer):
-
-    def score(self, A: np.array, B: np.array) -> float:
-        return iou(A, B)
 
 
 class Model(ABC, SamPreTrainedModel):
@@ -104,6 +85,7 @@ class SamBaseline(Model):
         self.processor = processor
         self.seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="none")
         self.multimask_output = multimask_output
+        self.total_time = 0.0
 
     @property
     def mask_decoder(self):
@@ -117,6 +99,8 @@ class SamBaseline(Model):
         labels: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+
+        t = perf_counter()
 
         if image_embeddings is None:
             image_embeddings = self.sam.get_image_embeddings(pixel_values)
@@ -138,6 +122,8 @@ class SamBaseline(Model):
 
         loss = loss["loss"] + _iou_loss
 
+        self.total_time += perf_counter() - t
+
         return SamMultimaskOutput(
             loss=loss,
             iou_scores=outputs.iou_scores,
@@ -152,10 +138,10 @@ class SimSAM(Model):
         config, 
         processor, 
         num_simulations: int = 10, 
-        
         click_strategy: str = "topk",
-        scorer: str = "iou",
         pixel_aggregation: bool = False,
+        output_union_and_intersection: bool = False,
+        chunk_size: int = 50 # Enables batching of simulations to save memory
     ):
         super().__init__(config)
         self.sam = SamModel(config)
@@ -166,8 +152,11 @@ class SimSAM(Model):
 
         self.num_preds = 1
         self.click_strategy = ClickStrategy.create(click_strategy)()
-        self.scorer = SimilarityScorer.create(scorer)()
         self.pixel_aggregation = pixel_aggregation
+        self.output_union_and_intersection = output_union_and_intersection
+        self.chunk_size = chunk_size
+
+        self.total_time = 0.0
 
 
     def _get_clicks(
@@ -199,12 +188,13 @@ class SimSAM(Model):
         ), range(pred_masks.size(0))))
 
         input_points = torch.tensor(input_points).to(self.device).unsqueeze(1)
-        input_labels = torch.tensor(input_labels).to(self.device).unsqueeze(1)
+        input_labels = torch.tensor(np.array(input_labels)).to(self.device).unsqueeze(1)
 
         ratios = reshaped_input_sizes / original_sizes
         ratios = ratios.unsqueeze(1).unsqueeze(1).expand_as(input_points)
 
         return input_points * ratios, input_labels
+
 
     def _aggregation(
         self,
@@ -212,28 +202,29 @@ class SimSAM(Model):
         return_idxs=False,
     ):
 
-        p_pred = (F.sigmoid(pred_masks) > 0.5).squeeze(1).cpu().numpy()
-        shape = (p_pred.shape[0], p_pred.shape[1], p_pred.shape[1])
-        similarity_matrix = np.zeros(shape)
-        for i in range(shape[0]):
-            for j in range(shape[1]):
-                for k in range(shape[2]):
-                    similarity_matrix[i, j, k] = self.scorer.score(p_pred[i, j], p_pred[i, k])
-        
+        b_masks = (F.sigmoid(pred_masks) > 0.5).squeeze(1).squeeze(0)  # (num_simulations, H, W)
+        p_pred = b_masks.unsqueeze(1).expand(
+            self.num_simulations, self.num_simulations, *pred_masks.shape[-2:])
+
+        intersection = torch.logical_and(p_pred, p_pred.transpose(0, 1)).float()
+        union = torch.logical_or(p_pred, p_pred.transpose(0, 1)).float()
+
+        similarity_matrix = torch.sum(intersection, dim=(-1, -2)) / torch.sum(union, dim=(-1, -2))
+        # set nan values to 0
+        similarity_matrix[similarity_matrix != similarity_matrix] = 0.0
+        scores = similarity_matrix.unsqueeze(0).mean(-1)
+
         chosen_preds = []
         all_chosen_idxs = []
         for i in range(pred_masks.size(0)):
-            chosen_idxs = torch.topk(torch.tensor(similarity_matrix[i]).mean(-1), self.num_preds).indices
+            chosen_idxs = torch.topk(scores[i], self.num_preds).indices
             chosen_preds.append(pred_masks[i, :, chosen_idxs])
             all_chosen_idxs.append(chosen_idxs)
         chosen_preds = torch.stack(chosen_preds, dim=0)
-        try:
-            all_chosen_idxs = torch.stack(all_chosen_idxs).to(self.device)
-        except:
-            all_chosen_idxs = torch.tensor(all_chosen_idxs).to(self.device)
+        all_chosen_idxs = torch.stack(all_chosen_idxs).to(self.device)
 
         if return_idxs:
-            return chosen_preds, all_chosen_idxs, np.mean(similarity_matrix, axis=-1)
+            return chosen_preds, all_chosen_idxs, scores.cpu().numpy()
 
         return chosen_preds
 
@@ -267,33 +258,34 @@ class SimSAM(Model):
         )
 
         bsz = input_points.size(0)
-        CHUNK_SIZE = min(10, self.num_simulations)
+        chunk_size = min(self.chunk_size, self.num_simulations)
 
-        chunk_image_embeddings = image_embeddings.repeat_interleave(CHUNK_SIZE, dim=0)
+        chunk_image_embeddings = image_embeddings.repeat_interleave(chunk_size, dim=0)
         if input_boxes is not None:
-            input_boxes = input_boxes.repeat_interleave(CHUNK_SIZE, dim=0)
+            input_boxes = input_boxes.repeat_interleave(chunk_size, dim=0)
         
-        input_masks = (F.sigmoid(input_masks) > 0.5).repeat_interleave(CHUNK_SIZE, dim=0).float()
+        input_masks = (F.sigmoid(input_masks) > 0.5).repeat_interleave(chunk_size, dim=0).float().squeeze(2).to(self.device)
         all_pred_masks = []
         all_pred_iou = []
 
-        for j in range(0, self.num_simulations, CHUNK_SIZE):
+        for j in range(0, self.num_simulations, chunk_size):
 
-            chunk_input_points = input_points[:, :, j:j+CHUNK_SIZE].reshape(
-                bsz * CHUNK_SIZE, 1, 1, 2)
-            chunk_input_labels = input_labels[:, :, j:j+CHUNK_SIZE].reshape(
-                bsz * CHUNK_SIZE, 1, 1)
+            chunk_input_points = input_points[:, :, j:j+chunk_size].reshape(
+                bsz * chunk_size, 1, 1, 2)
+            chunk_input_labels = input_labels[:, :, j:j+chunk_size].reshape(
+                bsz * chunk_size, 1, 1)
 
             outputs = self.sam(
                 image_embeddings=chunk_image_embeddings,
                 input_points=chunk_input_points,
                 input_labels=chunk_input_labels,
                 input_boxes=input_boxes,
-                input_masks=input_masks.squeeze(2).to(self.device),
+                input_masks=input_masks,
                 multimask_output=False
             )
-            pred_masks = outputs.pred_masks.reshape(-1, 1, CHUNK_SIZE, *pred_masks.shape[-2:])
-            pred_iou = outputs.iou_scores.reshape(-1, CHUNK_SIZE)
+            
+            pred_masks = outputs.pred_masks.reshape(-1, 1, chunk_size, *pred_masks.shape[-2:])
+            pred_iou = outputs.iou_scores.reshape(-1, chunk_size)
             all_pred_masks.append(pred_masks)
             all_pred_iou.append(pred_iou)
         
@@ -324,17 +316,19 @@ class SimSAM(Model):
         assert new_pred_masks.size(2) == self.num_simulations
 
         loss = self.compute_loss(new_pred_masks, labels, self.seg_loss)
-        original_sizes = original_sizes.repeat_interleave(self.num_simulations, dim=0)
-        reshaped_input_sizes = reshaped_input_sizes.repeat_interleave(self.num_simulations, dim=0)
 
-        union = (F.sigmoid(new_pred_masks) > 0.5).sum(dim=2, keepdim=True)
-        
-        # Find intersection between all masks along dim 2
-        intersection = torch.ones_like(union)
-        for i in range(self.num_simulations):
-            intersection *= (F.sigmoid(new_pred_masks[:, :, i]) > 0.5).int().unsqueeze(2)
+        # Find union and intersection between all masks along dim 2
+        union, intersection = None, None
+        if self.output_union_and_intersection:
+            union = (F.sigmoid(new_pred_masks) > 0.5).sum(dim=2, keepdim=True)
+            intersection = torch.ones_like(union)
+            for i in range(self.num_simulations):
+                intersection *= (F.sigmoid(new_pred_masks[:, :, i]) > 0.5).int().unsqueeze(2)
+            union = union.squeeze()
+            intersection = intersection.squeeze()
 
         pred_masks, idxs, pred_iou = self._aggregation(new_pred_masks, return_idxs=True)
+        
         iou_scores = torch.gather(torch.tensor(pred_iou).to(idxs.device), 1, idxs).unsqueeze(1)
 
         # Pixel aggregation ablation
@@ -346,8 +340,8 @@ class SimSAM(Model):
             loss=loss,
             iou_scores=iou_scores,
             pred_masks=pred_masks,
-            union=union.squeeze(),
-            intersection=intersection.squeeze(),
+            union=union,
+            intersection=intersection,
         )
 
     def forward(
@@ -360,6 +354,7 @@ class SimSAM(Model):
         reshaped_input_sizes=None,
     ):
         
+        t = perf_counter()
         if self.training:
             raise NotImplementedError("Training not supported yet")
         
@@ -380,5 +375,6 @@ class SimSAM(Model):
             reshaped_input_sizes=reshaped_input_sizes,
             labels=labels,
         )
+        self.total_time += perf_counter() - t
 
         return outputs
