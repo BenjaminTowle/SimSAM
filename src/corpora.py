@@ -6,7 +6,7 @@ import torch
 
 from abc import ABC, abstractmethod
 
-from datasets import Dataset, DatasetDict, concatenate_datasets
+from datasets import Dataset, DatasetDict
 from itertools import chain
 from os.path import join
 from PIL import Image
@@ -22,9 +22,9 @@ class PreprocessingStrategy(ABC, RegistryMixin):
     file_reader = "default"
 
     @staticmethod
-    def train_valid_test_split(dataset, valid_size, test_size) -> dict:
-        """Split the dataset into train, valid, and test subsets.
-        """
+    def train_valid_test_split(
+        dataset: Dataset, valid_size: float, test_size: float) -> dict:
+
         dataset = dataset.train_test_split(test_size=test_size)
         train_valid = dataset["train"].train_test_split(test_size=valid_size)
         dataset["train"] = train_valid["train"]
@@ -32,11 +32,9 @@ class PreprocessingStrategy(ABC, RegistryMixin):
         return dataset
 
     @abstractmethod
-    def preprocess(self, processor: SamProcessor, valid_size: float = 0.1, test_size: float = 0.1, **kwargs):
-        """Preprocess the dataset using the given processor.
-        """
+    def preprocess(
+        self, processor: SamProcessor, valid_size: float = 0.1, test_size: float = 0.1, **kwargs):
         pass
-
 
 
 @PreprocessingStrategy.register_subclass("busi")
@@ -46,14 +44,17 @@ class BUSIPreprocessingStrategy(PreprocessingStrategy):
         self, 
         processor: SamProcessor, 
         valid_size: float = 0.1, 
-        test_size: float = 0.1, 
-        kd: bool = False,
-        use_bounding_box: bool = True,
-        do_split: bool = True,
-    ):
+        test_size: float = 0.1,
+        use_bounding_box: bool = True
+    ) -> DatasetDict:
+
         dataset_path = "data/Dataset_BUSI_with_GT"
         paths = {}  # dictionary matching ids to image path and label path key-value pairs
-        for file in chain(os.listdir(os.path.join(dataset_path, "benign")), os.listdir(os.path.join(dataset_path, "malignant"))):
+        chains = [
+            os.listdir(join(dataset_path, "benign")), 
+            os.listdir(join(dataset_path, "malignant"))
+        ]
+        for file in chain(*chains):
             # Each file string contains a number, use re to extract this
             idx = re.search(r"\d+", file).group(0)
             if idx not in paths:
@@ -76,14 +77,11 @@ class BUSIPreprocessingStrategy(PreprocessingStrategy):
         
         dataset = Dataset.from_dict({"image": image, "label": label})
 
-        dataset_cls = PathDataset
-
-        if do_split:
-            dataset = self.train_valid_test_split(dataset, valid_size, test_size)
-            for key in dataset.keys():
-                dataset[key] = dataset_cls(dataset[key], processor, dataset_path, use_bounding_box=use_bounding_box)
-        else:
-            dataset = dataset_cls(dataset, processor, dataset_path, use_bounding_box=use_bounding_box)
+        dataset = self.train_valid_test_split(dataset, valid_size, test_size)
+        for key in dataset.keys():
+            dataset[key] = PathDataset(
+                dataset[key], processor, dataset_path, use_bounding_box=use_bounding_box)
+        
         return dataset
 
 
@@ -98,9 +96,8 @@ class CVCPreprocessingStrategy(PreprocessingStrategy):
         valid_size: float = 0.1, 
         test_size: float = 0.1, 
         use_bounding_box: bool = True,
-        do_split: bool = True,
-        **kwargs
-    ):
+    ) -> DatasetDict:
+
         dataset_path = "data/CVC-ClinicDB"
         paths = {}
         for file in os.listdir(os.path.join(dataset_path, "Original")):
@@ -114,13 +111,11 @@ class CVCPreprocessingStrategy(PreprocessingStrategy):
             label.append(path["label"])
         dataset = Dataset.from_dict({"image": image, "label": label})
 
-        if do_split:
-            dataset = self.train_valid_test_split(dataset, valid_size, test_size)
-            for key in dataset.keys():
-                dataset[key] = PathDataset(dataset[key], processor, dataset_path, file_reader=self.file_reader, use_bounding_box=use_bounding_box)
-        else:
-            dataset = PathDataset(dataset, processor, dataset_path, file_reader=self.file_reader, use_bounding_box=use_bounding_box)
-        
+        dataset = self.train_valid_test_split(dataset, valid_size, test_size)
+        for key in dataset.keys():
+            dataset[key] = PathDataset(
+                dataset[key], processor, dataset_path, 
+                file_reader=self.file_reader, use_bounding_box=use_bounding_box)
 
         return dataset
 
@@ -133,11 +128,9 @@ class ISICPreprocessingStrategy(PreprocessingStrategy):
         processor: SamProcessor, 
         valid_size: float = 0.1, 
         test_size: float = 0.1, 
-        kd=False, 
         use_bounding_box: bool = True,
-        do_split: bool = True,
-        **kwargs
-    ):
+    ) -> DatasetDict:
+
         dataset_path = "data/ISIC2016"
         train_paths = {}
         test_paths = {}
@@ -183,18 +176,15 @@ class ISICPreprocessingStrategy(PreprocessingStrategy):
             "test": test_dataset
         })
 
-        dataset_cls = PathDataset
-        if do_split:
-            for key in dataset.keys():
-                dataset[key] = dataset_cls(dataset[key], processor, dataset_path, use_bounding_box=use_bounding_box)
-        else:
-            dataset = concatenate_datasets([dataset["train"], dataset["valid"], dataset["test"]])
-            dataset = dataset_cls(dataset, processor, dataset_path, use_bounding_box=use_bounding_box)
+        for key in dataset.keys():
+            dataset[key] = PathDataset(
+                dataset[key], processor, dataset_path, 
+                use_bounding_box=use_bounding_box)
 
         return dataset
 
 
-def get_bounding_box(ground_truth_map, add_perturbation=False):
+def get_bounding_box(ground_truth_map: np.array, add_perturbation: bool = False):
     # get bounding box from mask
     y_indices, x_indices = np.where(ground_truth_map > 0)
     if len(x_indices) == 0 or len(y_indices) == 0:
@@ -242,14 +232,22 @@ class PathDataset(TorchDataset):
     """
     A Dataset where the image and label are paths to the image and label respectively.
     """
-    def __init__(self, dataset, processor, dataset_path: str, file_reader: str = "default", use_bounding_box: bool = True):
+    def __init__(
+        self, 
+        dataset: Dataset, 
+        processor: SamProcessor, 
+        dataset_path: str, 
+        file_reader: str = "default", 
+        use_bounding_box: bool = True
+    ) -> None:
+
         self.dataset = dataset
         self.processor = processor
         self.dataset_path = dataset_path
         self.file_reader = FileReader.create(file_reader)()
         self.use_bounding_box = use_bounding_box
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.dataset)
 
     def preprocess(self, item):
@@ -292,7 +290,7 @@ class PathDataset(TorchDataset):
 
         return inputs
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         item = self.dataset[idx]
         inputs = self.preprocess(item)
 

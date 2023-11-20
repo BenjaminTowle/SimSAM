@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Tuple
 
 from src.utils import RegistryMixin
 
@@ -14,13 +14,9 @@ class ClickStrategy(ABC, RegistryMixin):
         self, 
         input_mask: torch.Tensor, 
         binary_input_mask: torch.Tensor,
-        label: Optional[torch.Tensor] = None, 
         num_samples: int = 1,
-        image_embeddings: Optional[torch.Tensor] = None,
-        input_boxes: Optional[torch.Tensor] = None
-    ):
+    ) -> Tuple[np.ndarray, np.ndarray]:
         pass
-
 
 
 @ClickStrategy.register_subclass("random")
@@ -33,17 +29,14 @@ class RandomClickStrategy(ClickStrategy):
         self, 
         input_mask: torch.Tensor, 
         binary_input_mask: torch.Tensor,
-        label: Optional[torch.Tensor] = None, 
         num_samples: int = 1,
-        image_embeddings: Optional[torch.Tensor] = None,
-        input_boxes: Optional[torch.Tensor] = None
-    ):
+    ) -> Tuple[np.ndarray, np.ndarray]:
 
         error_mask = torch.ones(input_mask.shape).to("cuda")
         probs = (error_mask / error_mask.sum()).reshape(-1)
 
         binary_input_mask = binary_input_mask.squeeze().cpu().numpy()
-        H, W = binary_input_mask.shape[-2:]
+        _, W = binary_input_mask.shape[-2:]
 
         idxs = torch.multinomial(probs, num_samples, replacement=True).cpu().numpy()
 
@@ -60,11 +53,8 @@ class SamplingClickStrategy(ClickStrategy):
         self, 
         input_mask: torch.Tensor, 
         binary_input_mask: torch.Tensor,
-        label: Optional[torch.Tensor] = None, 
         num_samples: int = 1,
-        image_embeddings: Optional[torch.Tensor] = None,
-        input_boxes: Optional[torch.Tensor] = None
-    ):
+    ) -> Tuple[np.ndarray, np.ndarray]:
 
         fp_mask = 1.0 - F.sigmoid(input_mask).squeeze().cpu().numpy()
         fn_mask = F.sigmoid(input_mask).squeeze().cpu().numpy()
@@ -79,7 +69,7 @@ class SamplingClickStrategy(ClickStrategy):
         idxs = topk.indices.cpu().numpy()
 
         binary_input_mask = binary_input_mask.squeeze().cpu().numpy()
-        H, W = binary_input_mask.shape[-2:]
+        _, W = binary_input_mask.shape[-2:]
 
         clicks = [[idx % W, idx // W] for idx in idxs]
         labels = 1.0 - binary_input_mask.reshape(-1)[idxs]

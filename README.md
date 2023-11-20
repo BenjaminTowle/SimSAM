@@ -35,7 +35,7 @@ python scripts/eval.py --model_load_path facebook/sam-vit-base \
 ```
 
 ## Training
-You can also finetune the SAM model on any of the datasets with:
+You can also fine-tune the SAM model on any of the datasets with:
 ```shell
 python scripts/train.py --model_load_path facebook/sam-vit-base \
     --model_save_path path/to/save/model \

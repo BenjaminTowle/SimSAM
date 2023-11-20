@@ -5,12 +5,14 @@ import torch.nn.functional as F
 
 from abc import ABC
 from dataclasses import dataclass
+from transformers import SamProcessor
 from transformers.models.sam.modeling_sam import (
     SamModel, 
     SamPreTrainedModel,
     SamImageSegmentationOutput,
+    SamConfig,
 )
-from typing import Optional, Callable
+from typing import Optional, Callable, Union, Tuple
 from time import perf_counter
 
 from src.click import ClickStrategy
@@ -19,14 +21,14 @@ from src.metrics import iou
 
 @dataclass
 class SamMultimaskOutput(SamImageSegmentationOutput):
-    loss: torch.FloatTensor = None
+    loss: torch.Tensor = None
     union: torch.Tensor = None
     intersection: torch.Tensor = None
 
 
 class Model(ABC, SamPreTrainedModel):
 
-    def __init__(self, config) -> None:
+    def __init__(self, config: SamConfig) -> None:
         super().__init__(config)
         self.sam = SamModel(config)
 
@@ -36,11 +38,8 @@ class Model(ABC, SamPreTrainedModel):
         labels: torch.Tensor, 
         loss_fn: Callable,
         return_dict: bool = False
-    ):
-        """
-        pred_masks: (bsz, 1, num_multimask_outputs, H, W)
-        labels: (bsz, H, W)
-        """
+    ) -> dict:
+        
         bsz, _, num_preds, H, W = pred_masks.size()
 
         loss = loss_fn(
@@ -61,7 +60,13 @@ class Model(ABC, SamPreTrainedModel):
         }
 
     @staticmethod
-    def iou_loss(pred_masks, iou_pred, labels, return_iou=False):
+    def iou_loss(
+        pred_masks: torch.Tensor, 
+        iou_pred: torch.Tensor, 
+        labels: torch.Tensor, 
+        return_iou: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        
         bsz, _, num_preds, H, W = pred_masks.size()
         iou_targets = torch.zeros(bsz, num_preds).to(pred_masks.device)
         pred_masks = pred_masks.squeeze(1).detach().cpu().numpy() > 0.5
@@ -79,12 +84,17 @@ class Model(ABC, SamPreTrainedModel):
 
 class SamBaseline(Model):
 
-    def __init__(self, config, processor, multimask_output: bool = True):
+    def __init__(
+        self, 
+        config: SamConfig, 
+        processor: SamProcessor, 
+    ) -> None:
+
         super().__init__(config)
         self.sam = SamModel(config)
         self.processor = processor
         self.seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="none")
-        self.multimask_output = multimask_output
+        
         self.total_time = 0.0
 
     @property
@@ -97,8 +107,7 @@ class SamBaseline(Model):
         image_embeddings: Optional[torch.Tensor] = None,
         input_boxes: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
+    ) -> SamMultimaskOutput:
 
         t = perf_counter()
 
@@ -108,7 +117,7 @@ class SamBaseline(Model):
         outputs = self.sam(
             image_embeddings=image_embeddings, 
             input_boxes=input_boxes,
-            multimask_output=self.multimask_output,
+            multimask_output=False,
         )
 
         loss = self.compute_loss(
@@ -135,14 +144,15 @@ class SimSAM(Model):
 
     def __init__(
         self, 
-        config, 
-        processor, 
+        config: SamConfig, 
+        processor: SamProcessor, 
         num_simulations: int = 10, 
         click_strategy: str = "topk",
         pixel_aggregation: bool = False,
         output_union_and_intersection: bool = False,
         chunk_size: int = 50 # Enables batching of simulations to save memory
-    ):
+    ) -> None:
+    
         super().__init__(config)
         self.sam = SamModel(config)
         self.seg_loss = monai.losses.DiceLoss(
@@ -165,11 +175,8 @@ class SimSAM(Model):
         binary_input_masks: torch.Tensor,
         original_sizes: torch.Tensor,
         reshaped_input_sizes: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
         num_samples: int = 1,
-        image_embeddings: Optional[torch.Tensor] = None,
-        input_boxes: Optional[torch.Tensor] = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         input_masks = self.processor.image_processor.post_process_masks(
             pred_masks.cpu(), original_sizes.cpu(), 
@@ -181,10 +188,7 @@ class SimSAM(Model):
         input_points, input_labels = zip(*map(lambda i: self.click_strategy.get_click(
             input_mask=input_masks[i],
             binary_input_mask=binary_input_masks[i],
-            label=labels[i] if labels is not None else None,
             num_samples=num_samples,
-            image_embeddings=image_embeddings[i] if image_embeddings is not None else None,
-            input_boxes=input_boxes[i] if input_boxes is not None else None,
         ), range(pred_masks.size(0))))
 
         input_points = torch.tensor(input_points).to(self.device).unsqueeze(1)
@@ -198,9 +202,9 @@ class SimSAM(Model):
 
     def _aggregation(
         self,
-        pred_masks,
-        return_idxs=False,
-    ):
+        pred_masks: torch.Tensor,
+        return_idxs: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, np.array]]:
 
         b_masks = (F.sigmoid(pred_masks) > 0.5).squeeze(1).squeeze(0)  # (num_simulations, H, W)
         p_pred = b_masks.unsqueeze(1).expand(
@@ -230,13 +234,12 @@ class SimSAM(Model):
 
     def _simulation(
         self,
-        pred_masks,
+        pred_masks: torch.Tensor,
         image_embeddings: torch.Tensor,
-        input_boxes,
-        original_sizes,
-        reshaped_input_sizes,
-        i=0
-    ):
+        input_boxes: torch.Tensor,
+        original_sizes: torch.Tensor,
+        reshaped_input_sizes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         input_masks = self.processor.image_processor.post_process_masks(
                 pred_masks.cpu(), original_sizes.cpu(), 
@@ -251,10 +254,7 @@ class SimSAM(Model):
             binary_input_masks=binary_input_masks,
             original_sizes=original_sizes,
             reshaped_input_sizes=reshaped_input_sizes,
-            num_samples=self.num_simulations if i == 0 else 1,
-            image_embeddings=image_embeddings,
-            input_boxes=input_boxes,
-            labels=None,
+            num_samples=self.num_simulations,
         )
 
         bsz = input_points.size(0)
@@ -296,13 +296,14 @@ class SimSAM(Model):
 
     def _forward_eval(
         self,
-        pred_masks,
+        pred_masks: torch.Tensor,
         image_embeddings: torch.Tensor,
-        input_boxes,
-        original_sizes,
-        reshaped_input_sizes,
-        labels
-    ):
+        input_boxes: torch.Tensor,
+        original_sizes: torch.Tensor,
+        reshaped_input_sizes: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> SamMultimaskOutput:
+        
         assert pred_masks.size(0) == 1, "Only batch size 1 is supported for evaluation"
         
         new_pred_masks, _ = self._simulation(
@@ -312,8 +313,6 @@ class SimSAM(Model):
             original_sizes=original_sizes,
             reshaped_input_sizes=reshaped_input_sizes,
         )
-            
-        assert new_pred_masks.size(2) == self.num_simulations
 
         loss = self.compute_loss(new_pred_masks, labels, self.seg_loss)
 
@@ -328,7 +327,6 @@ class SimSAM(Model):
             intersection = intersection.squeeze()
 
         pred_masks, idxs, pred_iou = self._aggregation(new_pred_masks, return_idxs=True)
-        
         iou_scores = torch.gather(torch.tensor(pred_iou).to(idxs.device), 1, idxs).unsqueeze(1)
 
         # Pixel aggregation ablation
@@ -346,13 +344,13 @@ class SimSAM(Model):
 
     def forward(
         self, 
-        pixel_values=None,
-        image_embeddings=None,
-        input_boxes=None,
-        labels=None,
-        original_sizes=None,
-        reshaped_input_sizes=None,
-    ):
+        pixel_values: Optional[torch.Tensor] = None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        input_boxes: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        original_sizes: Optional[torch.Tensor] = None,
+        reshaped_input_sizes: Optional[torch.Tensor] = None
+    ) -> SamMultimaskOutput:
         
         t = perf_counter()
         if self.training:

@@ -85,7 +85,7 @@ def main():
 
     if args.model_type == "baseline":
         model = SamBaseline.from_pretrained(
-            args.model_load_path, processor=processor, multimask_output=False)
+            args.model_load_path, processor=processor)
     
     elif args.model_type == "simsam":
         model = SimSAM.from_pretrained(

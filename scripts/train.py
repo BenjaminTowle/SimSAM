@@ -1,5 +1,5 @@
 """
-File to finetune SAM on a dataset.
+Script to fine-tune SAM on a dataset.
 """
 
 import sys
@@ -66,8 +66,7 @@ class ModelArguments:
     )
 
 
-
-def _main(args):
+def _main(args: ModelArguments):
     # Load dataset
     processor = SamProcessor.from_pretrained(args.processor_load_path)
     preprocessing = PreprocessingStrategy.create(args.dataset)()
