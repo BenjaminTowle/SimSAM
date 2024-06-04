@@ -1,7 +1,11 @@
 # SimSAM: Zero-shot Medical Image Segmentation via Simulated Interaction
+[![arXiv](https://img.shields.io/badge/arXiv-2305.16852-b31b1b.svg)](https://arxiv.org/abs/2406.00663)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+
 ![simsam](assets/simsam_small.png)
 
-Official code for the ISBI 2024 submission: *SimSAM: Zero-shot Medical Image Segmentation via Simulated Interaction*
+Official code for the [ISBI 2024](https://biomedicalimaging.org/2024/) paper: *SimSAM: Zero-shot Medical Image Segmentation via Simulated Interaction*, which was awarded as a [top 12 oral paper](https://biomedicalimaging.org/2024/best-paper-award-finalists-announced/).
 
 ## Requirements
 * datasets
