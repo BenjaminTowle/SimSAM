@@ -1,5 +1,6 @@
 # SimSAM: Zero-shot Medical Image Segmentation via Simulated Interaction
 [![arXiv](https://img.shields.io/badge/arXiv-2305.16852-b31b1b.svg)](https://arxiv.org/abs/2406.00663)
+[![IEEE Paper](https://img.shields.io/badge/IEEE-Paper-blue)](https://ieeexplore.ieee.org/document/10635227)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 
